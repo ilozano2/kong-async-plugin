@@ -204,28 +204,92 @@ local function access_after(ctx, var)
   end
 end
 
+local function search_async_entity(id) 
+  local entity, err = kong.db.async_request_response:select({
+    id = id
+  })
+  
+  if err then
+    kong.log.err("Error searching X-Async-Kong-Id [" .. id .. "]: " .. err)
+    return nil
+  end
+  
+  if not entity then
+    kong.log.err("The X-Async-Kong-Id [" .. id .. "] hasn't match any previous request")
+    return nil
+  end
+
+  return entity
+end
+
+local function recreate_response(async_entity)
+  if async_entity.is_finished then
+    ngx.status = async_entity.res_status
+    ngx.header["X-Async-Kong-Id"] = async_entity.id
+    ngx.say(async_entity.res_body)
+
+    return ngx.exit(async_entity.res_status)
+  else
+    ngx.status = 202 -- TODO choose a better approach using different URLs when is_finished=true
+    ngx.header["X-Async-Kong-Id"] = async_entity.id
+    ngx.say("In progress")
+
+    return ngx.exit(202)
+  end
+
+  
+end
+
+local function create_async_entity()
+  local entity, err = kong.db.async_request_response:insert({})
+  
+  if not entity then
+    kong.log.err("Error when inserting async request response: " .. err)
+    return nil
+  end
+
+  return entity
+end
+
 function MyPluginHandler:access(config)
   kong.log.err("access: ", MyPluginHandler.timer_sys)
 
   kong.log.err("NGX var: ", type(ngx.var))
   kong.log.err("NGX req: ", type(ngx.req))
-  access_after(ngx.ctx, ngx.var)
-  local uri = ngx.var.upstream_uri
-  local method = ngx.req.get_method() or "GET"
-  local headers = ngx.req.get_headers() or {}
+  access_after(ngx.ctx, ngx.var) -- TODO Check
+
+  local method = ngx.req.get_method()
+  local headers = ngx.req.get_headers()
   local body = ngx.req.get_body_data()
   --local upstream_uri = ngx.var.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
-  local upstream_uri = "https://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
-  
---[[  kong.log.err("NGX headers: ", ngx.req.get_headers())
-  kong.log.err("NGX method: ", ngx.req.get_method())
-  kong.log.err("URI: ", ngx.var.uri)
-  kong.log.err("URL: ", ngx.req.url)
-  kong.log.err("uri from me: ", uri)
-  kong.log.err("URI: ", ngx.req.uri)
-  kong.log.err("Request: ", ngx.var.request_uri)
-  kong.log.err("Matcher: ", ngx.ctx.router_matches.uri)
---]]
+  local upstream_uri = ngx.ctx.balancer_data.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
+  local request_uri = ngx.var.scheme.."://".. ngx.var.http_host.. ngx.var.request_uri
+  if (ngx.var.query_string ~= nil) then request_uri = request_uri .."?"..ngx.var.query_string end
+
+  require("mobdebug").start()
+  local async_id = headers["X-Async-Kong-Id"]
+  kong.log.err("Async ID", async_id)
+  if async_id then
+    local async_entity = search_async_entity(async_id)
+
+    if async_entity then
+      kong.log.err("Found entity", async_entity)
+      return recreate_response(async_entity)
+    else
+      ngx.status = 404
+      ngx.header["X-Async-Kong-Id"] = async_id
+      ngx.say("Not Found")
+      return ngx.exit(404)
+    end
+  end
+
+  -- Otherwise, continue creating a new async request
+  local async_entity = create_async_entity()
+  if not async_entity then
+    kong.log.err("Failed to create async entity")
+    return ngx.exit(500)
+  end
+
   local function send_upstream_request(premature)
     if premature then
       return
@@ -238,6 +302,7 @@ function MyPluginHandler:access(config)
     ngx.log(ngx.INFO, "The full upstream URL is: ", upstream_uri)
     kong.log.err("NGX headers: ", cjson.encode(headers))
     kong.log.err("NGX method: ", method)
+    
     local res, err = httpc:request_uri(upstream_uri, {
       method = method
       --headers = headers,
@@ -247,25 +312,38 @@ function MyPluginHandler:access(config)
     if not res then
       kong.log("Failed to send request to upstream: ", err)
     else
-      kong.log("Upstream request sent with status: ", res.status, res.body)
+      local res_status = res.status
+      local res_body = res.body
+      kong.log("Upstream request sent with status: ", res_status, ",", res_body)
+
+      
+      local entity, err = kong.db.async_request_response:update(
+        { id = async_entity.id },
+        { res_body = res_body , res_status = res_status, is_finished = true }
+      )
+
+      if not entity then
+        kong.log.err("Error when updating async entity: " .. err)
+        return nil
+      end
     end
   end
 
 
   --local ok, err = MyPluginHandler.timer_sys:every(0.1, send_upstream_request)
-  local ok, err = MyPluginHandler.timer_sys:at(0.1, send_upstream_request)
+  local ok, err = MyPluginHandler.timer_sys:at(5, send_upstream_request)
   if not ok then
     kong.log.err("Failed to create timer: ", err)
     return ngx.exit(500) -- Fail-safe if the timer creation fails
   end
 
-  -- Immediately return a 303 response to the client
-  ngx.status = 303 -- HTTP status code for "See Other"
-  ngx.header["Location"] = "http://another-url"
-  ngx.say("Redirecting to another URL...")
+  ngx.status = 202 -- HTTP status code for "Accepted"
+  -- ngx.header["Location"] = request_uri
+  ngx.header["X-Async-Kong-Id"] = async_entity.id
+  ngx.say("Moved request 'X-Async-Kong-Id: "..async_entity.id.."' to the queue")
 
   -- Send the response to the client without waiting for the upstream request
-  return ngx.exit(303)
+  return ngx.exit(202)
 end
 
 --[[
