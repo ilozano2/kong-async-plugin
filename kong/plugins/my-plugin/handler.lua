@@ -1,3 +1,10 @@
+-- DISCLAIMER: This is an Proof of Concept, it is not ready for Production
+-- * It has been an iterative process understanding Kong, openresty and timerng
+-- * There are hardcoded values to be moved to global variables
+-- * There are functions added to the table MyPluginHandler just for simplicity, but they should be moved to proper modules
+-- * AsyncAPI doc generation is not implemented
+-- * Plugin technical design is not in the scope of this PoC
+
 local MyPluginHandler = {
   PRIORITY = -1001,
   VERSION = "0.0.1",
@@ -7,6 +14,97 @@ local http            = require("resty.http")
 local cjson           = require("cjson.safe")
 local kong            = kong
 local ngx             = ngx
+
+function MyPluginHandler:access(config)
+  kong.log.debug("access: ", MyPluginHandler.timer_sys)
+
+  -- TODO Check I can get Route/Service information (theoretically it is available https://www.youtube.com/watch?v=1sBui6Z0IDc&t=917s)
+  -- Otherwise, it seems that `ngx.ctx.balancer_data.scheme` os not calculated
+  MyPluginHandler:access_after(ngx.ctx, ngx.var)
+
+  -- TODO Create a table to abstract this information
+  local method = ngx.req.get_method()
+  local headers = ngx.req.get_headers()
+  local body = ngx.req.get_body_data()
+  local upstream_uri = ngx.ctx.balancer_data.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
+
+  local async_id = headers["X-Async-Kong-Id"]
+  kong.log.err("Async ID", async_id)
+  if async_id then
+    local async_entity = MyPluginHandler:search_async_entity(async_id)
+
+    if async_entity then
+      kong.log.debug("Found entity", async_entity)
+      return MyPluginHandler:recreate_response(async_entity)
+    else
+      ngx.status = 404
+      ngx.header["X-Async-Kong-Id"] = async_id
+      ngx.say("Not Found")
+      return ngx.exit(404)
+    end
+  end
+
+  -- Otherwise, continue creating a new async request
+  local async_entity = MyPluginHandler:create_async_entity()
+  if not async_entity then
+    kong.log.err("Failed to create async entity")
+    return ngx.exit(500)
+  end
+
+  local function send_upstream_request(premature)
+    if premature then
+      return
+    end
+  
+    -- Create a new HTTP client instance
+    local httpc = http.new()
+  
+    -- Send the original request to the upstream (non-blocking)
+    ngx.log(ngx.INFO, "The full upstream URL is: ", upstream_uri)
+    kong.log.debug("NGX headers: ", cjson.encode(headers))
+    kong.log.debug("NGX method: ", method)
+    
+    local res, err = httpc:request_uri(upstream_uri, {
+      method = method,
+      headers = headers,
+      body = body,
+    })
+  
+    if not res then
+      kong.log("Failed to send request to upstream: ", err)
+    else
+      local res_status = res.status
+      local res_body = res.body
+      kong.log("Upstream request sent with status: ", res_status, ",", res_body)
+
+      
+      local entity, err = kong.db.async_request_response:update(
+        { id = async_entity.id },
+        { res_body = res_body , res_status = res_status, is_finished = true }
+      )
+
+      if not entity then
+        kong.log.err("Error when updating async entity: " .. err)
+        return nil
+      end
+    end
+  end
+
+
+  local ok, err = MyPluginHandler.timer_sys:at(5, send_upstream_request)
+  if not ok then
+    kong.log.err("Failed to create timer: ", err)
+    return ngx.exit(500) -- Fail-safe if the timer creation fails
+  end
+
+  ngx.status = 202 -- HTTP status code for "Accepted"
+  -- ngx.header["Location"] = request_uri
+  ngx.header["X-Async-Kong-Id"] = async_entity.id
+  ngx.say("Moved request 'X-Async-Kong-Id: "..async_entity.id.."' to the queue")
+
+  -- Send the response to the client without waiting for the upstream request
+  return ngx.exit(202)
+end
 
 -- BEGIN Code picked from core because I need to figure out how to get Route/Service information before sending req to upstream (on access)
 local get_header
@@ -113,7 +211,7 @@ local function balancer_execute(ctx)
   return ok, err, errcode
 end
 
-local function access_after(ctx, var)
+function MyPluginHandler:access_after(ctx, var)
   -- Nginx's behavior when proxying a request with an empty querystring
   -- `/foo?` is to keep `$is_args` an empty string, hence effectively
   -- stripping the empty querystring.
@@ -208,7 +306,7 @@ local function access_after(ctx, var)
   end
 end
 
-local function search_async_entity(id) 
+function MyPluginHandler:search_async_entity(id) 
   local entity, err = kong.db.async_request_response:select({
     id = id
   })
@@ -226,7 +324,7 @@ local function search_async_entity(id)
   return entity
 end
 
-local function recreate_response(async_entity)
+function MyPluginHandler:recreate_response(async_entity)
   if async_entity.is_finished then
     ngx.status = async_entity.res_status
     ngx.header["X-Async-Kong-Id"] = async_entity.id
@@ -244,7 +342,7 @@ local function recreate_response(async_entity)
   
 end
 
-local function create_async_entity()
+function MyPluginHandler:create_async_entity()
   local entity, err = kong.db.async_request_response:insert({})
   
   if not entity then
@@ -255,95 +353,5 @@ local function create_async_entity()
   return entity
 end
 -- END Code picked from core because.. (TODO Move to a module or re-use if possible and need) 
-
-function MyPluginHandler:access(config)
-  kong.log.debug("access: ", MyPluginHandler.timer_sys)
-
-  -- TODO Check I can get Route/Service information (theoretically it is available https://www.youtube.com/watch?v=1sBui6Z0IDc&t=917s)
-  access_after(ngx.ctx, ngx.var)
-
-  local method = ngx.req.get_method()
-  local headers = ngx.req.get_headers()
-  local body = ngx.req.get_body_data()
-  local upstream_uri = ngx.ctx.balancer_data.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
-
-  local async_id = headers["X-Async-Kong-Id"]
-  kong.log.err("Async ID", async_id)
-  if async_id then
-    local async_entity = search_async_entity(async_id)
-
-    if async_entity then
-      kong.log.err("Found entity", async_entity)
-      return recreate_response(async_entity)
-    else
-      ngx.status = 404
-      ngx.header["X-Async-Kong-Id"] = async_id
-      ngx.say("Not Found")
-      return ngx.exit(404)
-    end
-  end
-
-  -- Otherwise, continue creating a new async request
-  local async_entity = create_async_entity()
-  if not async_entity then
-    kong.log.err("Failed to create async entity")
-    return ngx.exit(500)
-  end
-
-  local function send_upstream_request(premature)
-    if premature then
-      return
-    end
-  
-    -- Create a new HTTP client instance
-    local httpc = http.new()
-  
-    -- Send the original request to the upstream (non-blocking)
-    ngx.log(ngx.INFO, "The full upstream URL is: ", upstream_uri)
-    kong.log.err("NGX headers: ", cjson.encode(headers))
-    kong.log.err("NGX method: ", method)
-    
-    local res, err = httpc:request_uri(upstream_uri, {
-      method = method,
-      headers = headers,
-      body = body,
-    })
-  
-    if not res then
-      kong.log("Failed to send request to upstream: ", err)
-    else
-      local res_status = res.status
-      local res_body = res.body
-      kong.log("Upstream request sent with status: ", res_status, ",", res_body)
-
-      
-      local entity, err = kong.db.async_request_response:update(
-        { id = async_entity.id },
-        { res_body = res_body , res_status = res_status, is_finished = true }
-      )
-
-      if not entity then
-        kong.log.err("Error when updating async entity: " .. err)
-        return nil
-      end
-    end
-  end
-
-
-  --local ok, err = MyPluginHandler.timer_sys:every(0.1, send_upstream_request)
-  local ok, err = MyPluginHandler.timer_sys:at(5, send_upstream_request)
-  if not ok then
-    kong.log.err("Failed to create timer: ", err)
-    return ngx.exit(500) -- Fail-safe if the timer creation fails
-  end
-
-  ngx.status = 202 -- HTTP status code for "Accepted"
-  -- ngx.header["Location"] = request_uri
-  ngx.header["X-Async-Kong-Id"] = async_entity.id
-  ngx.say("Moved request 'X-Async-Kong-Id: "..async_entity.id.."' to the queue")
-
-  -- Send the response to the client without waiting for the upstream request
-  return ngx.exit(202)
-end
 
 return MyPluginHandler
