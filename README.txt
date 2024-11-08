@@ -1,3 +1,9 @@
+# Proof Of Concepts
+
+<<<< WIP >>>>
+
+>>> NOTE: This repo only contains code; the README are just a few commands or notes I added for myself. For a better insight, check https://github.com/ilozano2/post-kong-async-plugin <<<
+
 ## TODO
 
 - [] Move old code to Lua modules
@@ -7,11 +13,6 @@
 - [] When response comes from timer, store custom entity response with "async_request_id"
 ...
 
-# Proof Of Concepts
-
-WIP
-
-NOTE: This repo only contains code; the README are just a few commands or notes I added for myself. For a better insight, check https://github.com/ilozano2/post-kong-async-plugin
 
 ## Useful
 
