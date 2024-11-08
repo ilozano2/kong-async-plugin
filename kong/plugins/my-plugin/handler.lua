@@ -7,10 +7,26 @@ local http            = require("resty.http")
 local cjson           = require("cjson.safe")
 local kong            = kong
 local ngx             = ngx
+
+-- BEGIN Code picked from core because I need to figure out how to get Route/Service information before sending req to upstream (on access)
 local get_header
 local subsystem         = ngx.config.subsystem
 local set_authority -- TODO
 local is_http_module   = subsystem == "http"
+local byte              = string.byte
+local lower             = string.lower
+local SPACE = byte(" ")
+local COMMA = byte(",")
+local QUESTION_MARK = byte("?")
+local sub               = string.sub
+local gsub              = string.gsub
+local find              = string.find
+local balancer     = require "kong.runloop.balancer"
+local exit              = ngx.exit
+local clear_header      = ngx.req.clear_header
+-- END 
+
+-- END Code picked from core because I cannot get Route/Service information at access (TODO it should be there according to https://www.youtube.com/watch?v=1sBui6Z0IDc&t=441s )
 if is_http_module then
   get_header = require("kong.tools.http").get_header
   set_authority = require("resty.kong.grpc").set_authority
@@ -26,18 +42,6 @@ function MyPluginHandler:init_worker()
   MyPluginHandler.timer_sys:start()
   kong.log.err("TIMER created: ", self.timer_sys)
 end
-
-local byte              = string.byte
-local lower             = string.lower
-local SPACE = byte(" ")
-local COMMA = byte(",")
-local QUESTION_MARK = byte("?")
-local sub               = string.sub
-local gsub              = string.gsub
-local find              = string.find
-local balancer     = require "kong.runloop.balancer"
-local exit              = ngx.exit
-local clear_header      = ngx.req.clear_header
 
 local function csv_iterator(s, b)
   if b == -1 then
@@ -250,23 +254,19 @@ local function create_async_entity()
 
   return entity
 end
+-- END Code picked from core because.. (TODO Move to a module or re-use if possible and need) 
 
 function MyPluginHandler:access(config)
-  kong.log.err("access: ", MyPluginHandler.timer_sys)
+  kong.log.debug("access: ", MyPluginHandler.timer_sys)
 
-  kong.log.err("NGX var: ", type(ngx.var))
-  kong.log.err("NGX req: ", type(ngx.req))
-  access_after(ngx.ctx, ngx.var) -- TODO Check
+  -- TODO Check I can get Route/Service information (theoretically it is available https://www.youtube.com/watch?v=1sBui6Z0IDc&t=917s)
+  access_after(ngx.ctx, ngx.var)
 
   local method = ngx.req.get_method()
   local headers = ngx.req.get_headers()
   local body = ngx.req.get_body_data()
-  --local upstream_uri = ngx.var.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
   local upstream_uri = ngx.ctx.balancer_data.scheme .. "://" .. ngx.var.upstream_host .. ngx.var.upstream_uri
-  local request_uri = ngx.var.scheme.."://".. ngx.var.http_host.. ngx.var.request_uri
-  if (ngx.var.query_string ~= nil) then request_uri = request_uri .."?"..ngx.var.query_string end
 
-  require("mobdebug").start()
   local async_id = headers["X-Async-Kong-Id"]
   kong.log.err("Async ID", async_id)
   if async_id then
@@ -304,9 +304,9 @@ function MyPluginHandler:access(config)
     kong.log.err("NGX method: ", method)
     
     local res, err = httpc:request_uri(upstream_uri, {
-      method = method
-      --headers = headers,
-      --body = body,
+      method = method,
+      headers = headers,
+      body = body,
     })
   
     if not res then
@@ -345,68 +345,5 @@ function MyPluginHandler:access(config)
   -- Send the response to the client without waiting for the upstream request
   return ngx.exit(202)
 end
-
---[[
-local function send_upstream_request()
-  -- Create a new HTTP client instance
-  local httpc = http.new()
-
-  -- Make the request to the upstream server (non-blocking)
-  local res, err = httpc:request_uri(ngx.var.upstream_url, {
-    method = ngx.req.get_method(),
-    headers = ngx.req.get_headers(),
-    body = ngx.req.get_body_data(),
-  })
-
-  if not res then
-    ngx.log(ngx.ERR, "Failed to send request to upstream: ", err)
-  else
-    ngx.log(ngx.INFO, "Upstream request sent with status: ", res.status)
-  end
-end
-
-function MyPluginHandler:access(config)
-  -- Schedule the upstream request to be sent asynchronously
-  ngx.timer.at(0, send_upstream_request)
-
-  -- Immediately return a 303 response to the client
-  ngx.status = 303 -- HTTP status code for "See Other"
-  ngx.header["Location"] = "http://another-url"
-  ngx.say("Redirecting to another URL...")
-
-  -- Terminate the request and send the response to the client
-  return ngx.exit(303)
-end
---]]
-
---[[
-function MyPluginHandler:response(conf)
-  local httpc = http.new()
-
-  local res, err = httpc:request_uri("https://httpbin.konghq.com/anything", {
-    method = "GET",
-  })
-
-  if err then
-    return kong.response.error(500,
-      "Error when trying to access 3rd party service: " .. err,
-      { ["Content-Type"] = "text/html" })
-  end
-
-  local body_table, err = cjson.decode(res.body)
-  kong.log("hello", "world")
-  kong.log("hey", body_table)
-
-  if err then
-    return kong.response.error(500,
-      "Error while decoding 3rd party service response: " .. err,
-      { ["Content-Type"] = "text/html" })
-  end
-
-
-
-  kong.response.set_header(conf.response_header_name, body_table.url)
-end
---]]
 
 return MyPluginHandler
